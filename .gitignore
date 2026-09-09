@@ -1,0 +1,17 @@
+.venv
+images
+# Generated images/data (large, reproducible from scripts + raw data)
+images/
+images1/
+images3/
+merged_images/
+sheets_test/
+sheets_test2/
+sheets_v2_full/
+testdata/
+to_label/
+
+# Generated predictions (reproducible outputs)
+predictions.csv
+predictions2.csv
+predictions_v2_full.csv
