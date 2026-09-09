@@ -1,10 +1,16 @@
 """
 Horizon detection pipeline for flask images.
 
+Predicts a (possibly tilted) line: separate row values for the left and
+right edges of the image, rather than one flat row. A straight horizontal
+line doesn't fit every frame.
+
 Workflow:
 1. Generate pseudo-labels for all images using intensity thresholding
-2. Manually review/fix labels in labels.csv (spot check ~10-20%)
-3. Train HorizonNet to regress horizon row from image
+   (flat line only, see note in generate_labels)
+2. Manually review/fix labels in labels.csv, or hand-label from scratch
+   with manual_label.py (two clicks per image, captures real tilt)
+3. Train HorizonNet to regress (row_left, row_right) from image
 4. Run inference on new images
 
 Usage:
@@ -46,6 +52,12 @@ def candidate_horizon_row(img_arr, thresh_frac=0.92, top_rows=10, safety_margin=
       guaranteed to be background, not yet at the horizon) to figure
       out which columns are occluded by the object. Recompute the row
       profile using only unoccluded columns, over the full image.
+
+    This estimates a single flat row. It does NOT detect tilt, since a
+    global row-mean threshold has no notion of left vs right. Pseudo-labels
+    from this function always come out with row_left == row_right. If your
+    images have meaningful tilt, hand-label with manual_label.py instead,
+    or treat these as a rough starting point to correct by hand.
     """
     h, w = img_arr.shape
 
@@ -75,8 +87,10 @@ def candidate_horizon_row(img_arr, thresh_frac=0.92, top_rows=10, safety_margin=
 def generate_labels(img_dir, out_csv, thresh_frac=0.92):
     """
     Walk img_dir, compute pseudo-label for each image, write to CSV.
-    You should open out_csv afterward and hand-correct any row where
-    the model's guess looks wrong (heavy blur, low contrast, weird lighting).
+    Produces a flat line (row_left_px == row_right_px) since the threshold
+    heuristic can't detect tilt. Open out_csv afterward and hand-correct
+    any obviously wrong or tilted rows before training, or better, use
+    manual_label.py from the start if tilt matters for your data.
     """
     rows = []
     files = sorted(f for f in os.listdir(img_dir) if f.lower().endswith((".jpg", ".jpeg", ".png")))
@@ -87,15 +101,16 @@ def generate_labels(img_dir, out_csv, thresh_frac=0.92):
         h = arr.shape[0]
         row = candidate_horizon_row(arr, thresh_frac=thresh_frac)
         norm_row = row / h if row >= 0 else -1
-        rows.append((fname, row, norm_row, h))
+        rows.append((fname, row, row, norm_row, norm_row, h))
 
     with open(out_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["filename", "row_px", "row_norm", "img_height"])
+        writer.writerow(["filename", "row_left_px", "row_right_px",
+                          "row_left_norm", "row_right_norm", "img_height"])
         writer.writerows(rows)
 
     print(f"Wrote {len(rows)} pseudo-labels to {out_csv}")
-    print("Review this file and fix any obviously wrong rows before training.")
+    print("These are all flat lines (no tilt). Review and hand-correct before training.")
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +125,21 @@ class HorizonDataset(Dataset):
         missing = 0
         with open(labels_csv, newline="") as f:
             reader = csv.DictReader(f)
+            has_tilt_cols = "row_left_norm" in (reader.fieldnames or [])
             for r in reader:
-                if float(r["row_norm"]) < 0:
+                if has_tilt_cols:
+                    left = float(r["row_left_norm"])
+                    right = float(r["row_right_norm"])
+                else:
+                    # backward compatible with old single-row label files:
+                    # treat as a flat line, left == right
+                    left = right = float(r["row_norm"])
+                if left < 0 or right < 0:
                     continue  # skip failed labels
                 if not os.path.exists(os.path.join(img_dir, r["filename"])):
                     missing += 1
                     continue
-                self.samples.append((r["filename"], float(r["row_norm"])))
+                self.samples.append((r["filename"], left, right))
         if missing:
             print(f"Warning: {missing} labeled rows point to files not found in {img_dir}, skipped them")
 
@@ -129,7 +152,7 @@ class HorizonDataset(Dataset):
         arr = np.array(img, dtype=np.float32) / 255.0
         return arr
 
-    def _augment(self, arr):
+    def _augment(self, arr, left, right):
         # brightness/contrast jitter
         if random.random() < 0.7:
             gain = random.uniform(0.8, 1.2)
@@ -151,19 +174,22 @@ class HorizonDataset(Dataset):
             arr = arr.copy()
             arr[mask] = random.uniform(0, 0.3)
 
-        # horizontal flip (doesn't change horizon row)
+        # horizontal flip: mirrors the image left-right, so the line's
+        # left and right endpoints must swap too, or every flipped tilted
+        # example would train the model on the wrong direction of tilt
         if random.random() < 0.5:
             arr = np.ascontiguousarray(arr[:, ::-1])
+            left, right = right, left
 
-        return arr
+        return arr, left, right
 
     def __getitem__(self, idx):
-        fname, row_norm = self.samples[idx]
+        fname, left, right = self.samples[idx]
         arr = self._load(fname)
         if self.augment:
-            arr = self._augment(arr)
+            arr, left, right = self._augment(arr, left, right)
         tensor = torch.from_numpy(arr).unsqueeze(0).float()  # (1, H, W)
-        target = torch.tensor([row_norm], dtype=torch.float32)
+        target = torch.tensor([left, right], dtype=torch.float32)
         return tensor, target
 
 
@@ -172,7 +198,7 @@ class HorizonDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class HorizonNet(nn.Module):
-    def __init__(self, out_dim=1):
+    def __init__(self, out_dim=2):  # 2 = row_left, row_right
         super().__init__()
 
         def block(cin, cout, stride=2):
@@ -192,7 +218,7 @@ class HorizonNet(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, out_dim),
-            nn.Sigmoid(),  # output in [0, 1], multiply by img height for pixels
+            nn.Sigmoid(),  # output in [0, 1] each, multiply by img height for pixels
         )
 
     def forward(self, x):
@@ -203,8 +229,31 @@ class HorizonNet(nn.Module):
 # 4. Train / eval loop
 # ---------------------------------------------------------------------------
 
+def load_checkpoint_partial(model, checkpoint_path, device):
+    """
+    Load a checkpoint even if some layers don't match (e.g. the old model
+    had a 1-value output head, this one has 2). Matching layers (the
+    feature extractor, which transfers fine) are loaded as-is. Mismatched
+    layers are skipped and stay at their fresh random initialization.
+    """
+    checkpoint_state = torch.load(checkpoint_path, map_location=device)
+    model_state = model.state_dict()
+    matched = {}
+    skipped = []
+    for k, v in checkpoint_state.items():
+        if k in model_state and model_state[k].shape == v.shape:
+            matched[k] = v
+        else:
+            skipped.append(k)
+    model_state.update(matched)
+    model.load_state_dict(model_state)
+    print(f"Loaded {len(matched)}/{len(checkpoint_state)} layers from {checkpoint_path}")
+    if skipped:
+        print(f"Skipped (shape mismatch, freshly initialized instead): {skipped}")
+
+
 def train(img_dir, labels_csv, epochs=50, batch_size=16, lr=1e-3,
-          val_frac=0.15, checkpoint_out="model.pt", device=None):
+          val_frac=0.15, checkpoint_out="model.pt", init_checkpoint=None, device=None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     full_ds = HorizonDataset(img_dir, labels_csv, augment=True)
@@ -217,6 +266,9 @@ def train(img_dir, labels_csv, epochs=50, batch_size=16, lr=1e-3,
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2)
 
     model = HorizonNet().to(device)
+    if init_checkpoint is not None:
+        load_checkpoint_partial(model, init_checkpoint, device)
+        print(f"Fine-tuning from {init_checkpoint}")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
     criterion = nn.SmoothL1Loss()
@@ -274,13 +326,18 @@ def infer(img_dir, checkpoint, out_csv="predictions.csv", device=None):
             img_resized = img.resize((IMG_W, IMG_H))
             arr = np.array(img_resized, dtype=np.float32) / 255.0
             tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float().to(device)
-            pred_norm = model(tensor).item()
-            pred_px = pred_norm * orig_h
-            rows.append((fname, pred_px, pred_norm))
+            pred = model(tensor).squeeze(0).cpu().numpy()
+            left_norm, right_norm = float(pred[0]), float(pred[1])
+            left_px, right_px = left_norm * orig_h, right_norm * orig_h
+            # row_px/row_norm kept as the average, for anything downstream
+            # that still expects a single flat-line value
+            rows.append((fname, left_px, right_px, left_norm, right_norm,
+                         (left_px + right_px) / 2, (left_norm + right_norm) / 2))
 
     with open(out_csv, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["filename", "row_px", "row_norm"])
+        writer.writerow(["filename", "row_left_px", "row_right_px",
+                          "row_left_norm", "row_right_norm", "row_px", "row_norm"])
         writer.writerows(rows)
 
     print(f"Wrote predictions for {len(rows)} images to {out_csv}")
@@ -306,6 +363,8 @@ if __name__ == "__main__":
     p_train.add_argument("--batch_size", type=int, default=16)
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--checkpoint_out", default="model.pt")
+    p_train.add_argument("--init_checkpoint", default=None,
+                          help="start from these weights instead of training from scratch (fine-tuning)")
 
     p_infer = sub.add_parser("infer")
     p_infer.add_argument("--img_dir", required=True)
@@ -319,6 +378,6 @@ if __name__ == "__main__":
     elif args.cmd == "train":
         train(args.img_dir, args.labels, epochs=args.epochs,
               batch_size=args.batch_size, lr=args.lr,
-              checkpoint_out=args.checkpoint_out)
+              checkpoint_out=args.checkpoint_out, init_checkpoint=args.init_checkpoint)
     elif args.cmd == "infer":
         infer(args.img_dir, args.checkpoint, args.out)

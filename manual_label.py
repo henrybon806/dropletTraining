@@ -1,9 +1,10 @@
 """
-Manually label the horizon row by clicking on images.
+Manually label a (possibly tilted) line by clicking twice per image.
 
-Click once on the horizon in each image window. Close the window without
-clicking to skip that image. Progress saves after every image, so you can
-stop and resume later, just re-run the same command.
+Click the LEFT end of the line first, then the RIGHT end. Close the window
+without clicking (or with only one click) to skip that image. Progress
+saves after every image, so you can stop and resume later, just re-run
+the same command.
 
 Usage:
     python manual_label.py --img_dir ./images --out labels_manual.csv --n 100
@@ -42,12 +43,14 @@ def main(img_dir, out_csv, n, seed):
         return
 
     print(f"{len(done)} already labeled, labeling {len(remaining)} more")
-    print("Click on the horizon in each image. Close the window without clicking to skip.")
+    print("Click the LEFT end of the line, then the RIGHT end.")
+    print("Close the window without two clicks to skip that image.")
 
     with open(out_csv, "a", newline="") as f:
         writer = csv.writer(f)
         if write_header:
-            writer.writerow(["filename", "row_px", "row_norm", "img_height"])
+            writer.writerow(["filename", "row_left_px", "row_right_px",
+                              "row_left_norm", "row_right_norm", "img_height"])
 
         for fname in remaining:
             path = os.path.join(img_dir, fname)
@@ -56,21 +59,26 @@ def main(img_dir, out_csv, n, seed):
 
             fig, ax = plt.subplots(figsize=(10, 6))
             ax.imshow(img, cmap="gray")
-            ax.set_title(fname)
+            ax.set_title(f"{fname}  (click LEFT end, then RIGHT end)")
             ax.axis("off")
 
-            pts = plt.ginput(1, timeout=0)
+            pts = plt.ginput(2, timeout=0)
             plt.close(fig)
 
-            if not pts:
+            if len(pts) < 2:
                 print(f"skipped {fname}")
                 continue
 
-            row_px = pts[0][1]
-            row_norm = row_px / h
-            writer.writerow([fname, row_px, row_norm, h])
+            (x_left, y_left), (x_right, y_right) = pts
+            # sort by x, in case the two clicks were made right-to-left
+            if x_left > x_right:
+                (x_left, y_left), (x_right, y_right) = (x_right, y_right), (x_left, y_left)
+
+            left_norm = y_left / h
+            right_norm = y_right / h
+            writer.writerow([fname, y_left, y_right, left_norm, right_norm, h])
             f.flush()
-            print(f"{fname}: row={row_px:.1f} ({row_norm:.3f})")
+            print(f"{fname}: left={y_left:.1f} ({left_norm:.3f})  right={y_right:.1f} ({right_norm:.3f})")
 
     print("Done for this batch. Re-run the same command to label more if you raise --n.")
 

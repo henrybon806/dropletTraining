@@ -1,6 +1,6 @@
 """
 Build grid contact sheets from a flagged-images CSV, with the predicted
-horizon line drawn on each thumbnail, for fast visual scanning.
+(possibly tilted) line drawn on each thumbnail, for fast visual scanning.
 
 Usage:
     python make_contact_sheets.py --img_dir ./images --flagged flagged.csv --out ./sheets
@@ -14,10 +14,19 @@ import os
 from PIL import Image, ImageDraw
 
 
-def draw_line(img, row_px, color=(255, 0, 0), thickness=2):
+def draw_line(img, y_left, y_right, color=(255, 0, 0), thickness=2):
     draw = ImageDraw.Draw(img)
-    draw.line([(0, int(row_px)), (img.width, int(row_px))], fill=color, width=thickness)
+    draw.line([(0, int(y_left)), (img.width - 1, int(y_right))], fill=color, width=thickness)
     return img
+
+
+def get_line_endpoints(row, scale):
+    # Prefer left/right columns (tilted line) if present, fall back to a
+    # flat row_px for older CSVs that only have a single value.
+    if "row_left_px" in row and row["row_left_px"] not in (None, ""):
+        return float(row["row_left_px"]) * scale, float(row["row_right_px"]) * scale
+    flat = float(row["row_px"]) * scale
+    return flat, flat
 
 
 def make_sheets(img_dir, flagged_csv, out_dir, thumb_w=220, grid_rows=5, grid_cols=5):
@@ -37,9 +46,9 @@ def make_sheets(img_dir, flagged_csv, out_dir, thumb_w=220, grid_rows=5, grid_co
         for r in chunk:
             img = Image.open(os.path.join(img_dir, r["filename"])).convert("RGB")
             scale = thumb_w / img.width
-            row_px_scaled = float(r["row_px"]) * scale
+            y_left, y_right = get_line_endpoints(r, scale)
             img = img.resize((thumb_w, int(img.height * scale)))
-            img = draw_line(img, row_px_scaled)
+            img = draw_line(img, y_left, y_right)
             thumbs.append((img, r["filename"]))
             max_thumb_h = max(max_thumb_h, img.height)
 
