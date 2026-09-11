@@ -10,6 +10,7 @@ sheets_test2/
 sheets_v2_full/
 testdata/
 to_label/
+testimages/
 
 # Generated predictions (reproducible outputs)
 predictions.csv
