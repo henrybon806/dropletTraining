@@ -24,6 +24,7 @@ import csv
 import os
 import random
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -152,7 +153,84 @@ class HorizonDataset(Dataset):
         arr = np.array(img, dtype=np.float32) / 255.0
         return arr
 
+    def _rotate(self, arr, left, right, max_angle_deg=12):
+        """
+        Rotates the whole image by a small random angle, simulating a
+        tilted camera. Since the line and the scene rotate together, this
+        stays physically consistent, it's not fabricating a tilt that
+        wouldn't actually look like this.
+
+        left/right are normalized (0-1) row positions at x=0 and x=w-1.
+        After rotating, the line's y-value at those two columns is found
+        by rotating the original endpoints and re-reading off the line
+        equation at x=0 and x=w-1, since a rotated line's real endpoints
+        usually don't land exactly on the image's left/right edges anymore.
+        """
+        h, w = arr.shape
+        angle = random.uniform(-max_angle_deg, max_angle_deg)
+        cx, cy = w / 2.0, h / 2.0
+        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+        rotated = cv2.warpAffine(arr, M, (w, h), flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REFLECT101)
+
+        left_px, right_px = left * h, right * h
+        p0 = M @ np.array([0.0, left_px, 1.0])
+        p1 = M @ np.array([w - 1.0, right_px, 1.0])
+
+        dx = p1[0] - p0[0]
+        if abs(dx) < 1e-6:
+            new_left_px, new_right_px = p0[1], p1[1]
+        else:
+            slope = (p1[1] - p0[1]) / dx
+            new_left_px = p0[1] + slope * (0 - p0[0])
+            new_right_px = p0[1] + slope * ((w - 1) - p0[0])
+
+        new_left = np.clip(new_left_px / h, 0.0, 1.0)
+        new_right = np.clip(new_right_px / h, 0.0, 1.0)
+        return rotated, float(new_left), float(new_right)
+
+    def _vertical_crop_zoom(self, arr, left, right, max_crop_frac=0.25):
+        """
+        Crops a random vertical window (keeping the line inside it) and
+        resizes back to full size. This shifts where the line ends up
+        sitting in the frame, without fabricating any new content, it's
+        just a different framing/zoom of the same real image. Helps the
+        model see the line in positions your actual dataset might not
+        happen to cover much (e.g. near the very top or bottom).
+        """
+        h, w = arr.shape
+        line_min = min(left, right) * h
+        line_max = max(left, right) * h
+
+        max_top = max(0, min(max_crop_frac * h, line_min - 2))
+        max_bottom = max(0, min(max_crop_frac * h, (h - line_max) - 2))
+
+        crop_top = random.uniform(0, max_top)
+        crop_bottom = random.uniform(0, max_bottom)
+        y0, y1 = int(crop_top), int(h - crop_bottom)
+
+        if y1 - y0 < h * 0.5:  # sanity floor, don't crop away most of the image
+            return arr, left, right
+
+        cropped = arr[y0:y1, :]
+        resized = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        scale = h / (y1 - y0)
+        new_left = np.clip(((left * h) - y0) * scale / h, 0.0, 1.0)
+        new_right = np.clip(((right * h) - y0) * scale / h, 0.0, 1.0)
+        return resized, float(new_left), float(new_right)
+
     def _augment(self, arr, left, right):
+        # tilt: teaches the model steeper angles than your real dataset
+        # might mostly contain
+        if random.random() < 0.6:
+            arr, left, right = self._rotate(arr, left, right)
+
+        # vertical position: teaches the model the line can sit anywhere
+        # in frame, not just wherever your rig usually frames it
+        if random.random() < 0.6:
+            arr, left, right = self._vertical_crop_zoom(arr, left, right)
+
         # brightness/contrast jitter
         if random.random() < 0.7:
             gain = random.uniform(0.8, 1.2)

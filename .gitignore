@@ -11,6 +11,12 @@ sheets_v2_full/
 testdata/
 to_label/
 testimages/
+sheets_v4/
+sheets_new/
+sheets_rig/
+testingimages/
+to_label_round2/
+tomove/
 
 # Generated predictions (reproducible outputs)
 predictions.csv
