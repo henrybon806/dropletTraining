@@ -17,6 +17,15 @@ sheets_rig/
 testingimages/
 to_label_round2/
 tomove/
+dataset/*
+!dataset/labels.csv
+finetune_work/
+runtest2_relabel/
+sheets_v5/
+sheets_v5_testimages/
+sheets_runtest2/
+sheets_testingimages_v5/
+__pycache__/
 
 # Generated predictions (reproducible outputs)
 predictions.csv
